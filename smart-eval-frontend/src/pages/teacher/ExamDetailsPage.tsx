@@ -38,12 +38,34 @@ const ExamDetailsPage: React.FC = () => {
   const pollingCountRef = useRef<number>(0);
   const MAX_POLLS = 60; // Stop polling after 60 attempts (5 minutes)
 
+  // Student assignment state
+  const [students, setStudents] = useState<{ id: string; email: string; name: string; roll_number: string }[]>([])
+  const [assignEmail, setAssignEmail] = useState('')
+  const [isAssigning, setIsAssigning] = useState(false)
+  const [assignMsg, setAssignMsg] = useState<string | null>(null)
+
+  // Publish preview state
+  const [showPublishPreview, setShowPublishPreview] = useState(false)
+  const [publishPreview, setPublishPreview] = useState<any>(null)
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false)
+  const [isPublishing, setIsPublishing] = useState(false)
+
   useEffect(() => {
     if (examId) {
       dispatch(fetchExamById(examId));
       loadAnswerSheets();
+      loadStudents();
     }
   }, [dispatch, examId]);
+
+  const loadStudents = async () => {
+    try {
+      const data = await examService.listStudents()
+      setStudents(data)
+    } catch {
+      // Students may not exist yet
+    }
+  }
 
   // Derive a stable boolean for polling instead of depending on full answerSheets array
   const hasProcessing = answerSheets.some(s => s.status === 'processing');
@@ -243,6 +265,63 @@ const ExamDetailsPage: React.FC = () => {
       await dispatch(updateExamStatus({ examId, status: newStatus }));
     }
   };
+
+  const handleBulkAssign = async () => {
+    if (!examId || !assignEmail) return
+    setIsAssigning(true)
+    setAssignMsg(null)
+    try {
+      const result = await examService.bulkAssignSheets(examId, assignEmail)
+      setAssignMsg(`Assigned ${result.data?.assigned_count || 0} sheet(s) to ${assignEmail}`)
+      setAssignEmail('')
+      await loadAnswerSheets()
+    } catch (error: any) {
+      setAssignMsg(`Error: ${error.response?.data?.error?.message || 'Failed to assign sheets'}`)
+    } finally {
+      setIsAssigning(false)
+    }
+  }
+
+  const handleOpenPublishPreview = async () => {
+    if (!examId) return
+    setIsLoadingPreview(true)
+    setShowPublishPreview(true)
+    try {
+      const result = await examService.getPublishPreview(examId)
+      setPublishPreview(result.data)
+    } catch (error: any) {
+      alert(error.response?.data?.error?.message || 'Failed to load preview')
+      setShowPublishPreview(false)
+    } finally {
+      setIsLoadingPreview(false)
+    }
+  }
+
+  const handlePublish = async () => {
+    if (!examId) return
+    setIsPublishing(true)
+    try {
+      await examService.publishResults(examId)
+      setShowPublishPreview(false)
+      setPublishPreview(null)
+      await dispatch(fetchExamById(examId))
+    } catch (error: any) {
+      alert(error.response?.data?.error?.message || 'Failed to publish')
+    } finally {
+      setIsPublishing(false)
+    }
+  }
+
+  const handleUnpublish = async () => {
+    if (!examId) return
+    if (!window.confirm('Are you sure you want to unpublish? Students will no longer see their results.')) return
+    try {
+      await examService.unpublishResults(examId)
+      await dispatch(fetchExamById(examId))
+    } catch (error: any) {
+      alert(error.response?.data?.error?.message || 'Failed to unpublish')
+    }
+  }
 
   const handleBulkUpload = async (files: File[]) => {
     if (!examId) return;
@@ -538,6 +617,39 @@ const ExamDetailsPage: React.FC = () => {
                 </div>
               )}
 
+              {/* Assign Sheets to Student */}
+              {answerSheets.length > 0 && (
+                <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                  <h4 className="text-sm font-medium text-blue-900 mb-2">Assign Sheets to Student</h4>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={assignEmail}
+                      onChange={e => setAssignEmail(e.target.value)}
+                      className="flex-1 px-3 py-2 border border-gray-300 rounded-md text-sm"
+                    >
+                      <option value="">Select a student...</option>
+                      {students.map(s => (
+                        <option key={s.id} value={s.email}>
+                          {s.name || s.email} {s.roll_number ? `(${s.roll_number})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={handleBulkAssign}
+                      disabled={!assignEmail || isAssigning}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 text-sm whitespace-nowrap"
+                    >
+                      {isAssigning ? 'Assigning...' : 'Assign All Sheets'}
+                    </button>
+                  </div>
+                  {assignMsg && (
+                    <p className={`mt-2 text-xs ${assignMsg.startsWith('Error') ? 'text-red-600' : 'text-green-600'}`}>
+                      {assignMsg}
+                    </p>
+                  )}
+                </div>
+              )}
+
               {answerSheets.length > 0 ? (
                 <div className="overflow-x-auto">
                   <table className="min-w-full divide-y divide-gray-200">
@@ -697,10 +809,18 @@ const ExamDetailsPage: React.FC = () => {
                 )}
                 {currentExam.status === 'reviewing' && (
                   <button
-                    onClick={() => handleStatusChange('published')}
+                    onClick={handleOpenPublishPreview}
                     className="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors"
                   >
                     Publish Results
+                  </button>
+                )}
+                {currentExam.status === 'published' && (
+                  <button
+                    onClick={handleUnpublish}
+                    className="w-full px-4 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700 transition-colors"
+                  >
+                    Unpublish Results
                   </button>
                 )}
                 {currentExam.status === 'draft' && (
@@ -893,6 +1013,92 @@ const ExamDetailsPage: React.FC = () => {
               <pre className="bg-gray-50 p-4 rounded-md text-sm whitespace-pre-wrap border border-gray-200 text-gray-800">
                 {qpExtractedText}
               </pre>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Publish Preview Modal */}
+      {showPublishPreview && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg max-w-lg w-full mx-4 overflow-hidden">
+            <div className="flex justify-between items-center p-4 border-b">
+              <h3 className="text-lg font-semibold text-gray-900">Publish Results Preview</h3>
+              <button
+                onClick={() => { setShowPublishPreview(false); setPublishPreview(null); }}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="p-6">
+              {isLoadingPreview ? (
+                <div className="text-center py-8">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
+                  <p className="mt-3 text-gray-500">Loading preview...</p>
+                </div>
+              ) : publishPreview ? (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-blue-50 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-blue-700">{publishPreview.total_sheets}</p>
+                      <p className="text-xs text-blue-600">Total Sheets</p>
+                    </div>
+                    <div className="bg-green-50 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-green-700">{publishPreview.graded_count}</p>
+                      <p className="text-xs text-green-600">Graded</p>
+                    </div>
+                    <div className="bg-purple-50 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-purple-700">{publishPreview.assigned_students}</p>
+                      <p className="text-xs text-purple-600">Assigned Students</p>
+                    </div>
+                    <div className="bg-amber-50 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-amber-700">{publishPreview.average_score}%</p>
+                      <p className="text-xs text-amber-600">Average Score</p>
+                    </div>
+                  </div>
+
+                  <div className="border rounded-lg p-4">
+                    <h4 className="text-sm font-medium text-gray-700 mb-2">Score Distribution</h4>
+                    <div className="space-y-1 text-sm">
+                      <div className="flex justify-between"><span className="text-green-700">90-100%</span><span className="font-medium">{publishPreview.distribution?.['90_100'] || 0}</span></div>
+                      <div className="flex justify-between"><span className="text-blue-700">75-89%</span><span className="font-medium">{publishPreview.distribution?.['75_89'] || 0}</span></div>
+                      <div className="flex justify-between"><span className="text-yellow-700">50-74%</span><span className="font-medium">{publishPreview.distribution?.['50_74'] || 0}</span></div>
+                      <div className="flex justify-between"><span className="text-orange-700">33-49%</span><span className="font-medium">{publishPreview.distribution?.['33_49'] || 0}</span></div>
+                      <div className="flex justify-between"><span className="text-red-700">Below 33%</span><span className="font-medium">{publishPreview.distribution?.['below_33'] || 0}</span></div>
+                    </div>
+                  </div>
+
+                  {publishPreview.ungraded_count > 0 && (
+                    <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm text-yellow-800">
+                      Warning: {publishPreview.ungraded_count} sheet(s) have not been graded yet.
+                    </div>
+                  )}
+                  {publishPreview.unassigned_sheets > 0 && (
+                    <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm text-yellow-800">
+                      Warning: {publishPreview.unassigned_sheets} sheet(s) are not assigned to students.
+                    </div>
+                  )}
+
+                  <div className="flex space-x-3 pt-2">
+                    <button
+                      onClick={() => { setShowPublishPreview(false); setPublishPreview(null); }}
+                      className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handlePublish}
+                      disabled={isPublishing || !publishPreview.ready_to_publish}
+                      className="flex-1 px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50"
+                    >
+                      {isPublishing ? 'Publishing...' : 'Confirm Publish'}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>

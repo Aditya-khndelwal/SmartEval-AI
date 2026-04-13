@@ -3,7 +3,7 @@ Exam API Routes
 
 RESTful endpoints for exam management
 """
-from flask import Blueprint, request
+from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from marshmallow import ValidationError as MarshmallowValidationError
 
@@ -22,6 +22,7 @@ from utils.helpers import success_response, error_response
 from utils.exceptions import ValidationError, NotFoundError, ForbiddenError
 from models.exam import QuestionPaper, ModelAnswer, ParsedAnswer, GradingConfig
 from models.answer_sheet import AnswerSheet as AnswerSheetDoc, OriginalFile
+from models.user import User
 
 
 exam_bp = Blueprint('exams', __name__, url_prefix='/exams')
@@ -101,9 +102,8 @@ def create_exam():
         
         return success_response(
             data=exam.to_dict(),
-            message="Exam created successfully",
-            status_code=201
-        )
+            message="Exam created successfully"
+        ), 201
         
     except MarshmallowValidationError as e:
         return error_response(str(e), 400)
@@ -647,6 +647,289 @@ def extract_model_answer_text(exam_id):
     except Exception as e:
         print(f"[ExtractModelAnswer] Error: {e}")
         return error_response(f"Failed to extract model answer text: {str(e)}", 500)
+
+
+@exam_bp.route('/<exam_id>/publish-preview', methods=['GET'])
+@jwt_required()
+@role_required(['teacher'])
+def publish_preview(exam_id):
+    """
+    Preview statistics before publishing results.
+
+    GET /api/v1/exams/:exam_id/publish-preview
+    Returns summary: total sheets, graded count, score distribution, etc.
+    """
+    try:
+        from models.evaluation import Evaluation
+
+        current_user_id = get_jwt_identity()
+        exam = ExamService.get_exam_by_id(exam_id, teacher_id=current_user_id)
+
+        sheets = AnswerSheetDoc.objects(exam_id=exam.id)
+        total_sheets = sheets.count()
+
+        evaluations = Evaluation.objects(exam_id=exam.id, status__in=['completed', 'overridden'])
+        graded_count = evaluations.count()
+
+        # Score distribution
+        scores = []
+        assigned_students = 0
+        for ev in evaluations:
+            scores.append(ev.percentage)
+
+        for s in sheets:
+            if s.student_id and str(s.student_id.id) != str(exam.teacher_id.id):
+                assigned_students += 1
+
+        avg_score = sum(scores) / len(scores) if scores else 0
+        max_score = max(scores) if scores else 0
+        min_score = min(scores) if scores else 0
+
+        # Distribution buckets
+        dist = {'90_100': 0, '75_89': 0, '50_74': 0, '33_49': 0, 'below_33': 0}
+        for pct in scores:
+            if pct >= 90:
+                dist['90_100'] += 1
+            elif pct >= 75:
+                dist['75_89'] += 1
+            elif pct >= 50:
+                dist['50_74'] += 1
+            elif pct >= 33:
+                dist['33_49'] += 1
+            else:
+                dist['below_33'] += 1
+
+        return success_response(data={
+            'exam_id': str(exam.id),
+            'exam_title': exam.title,
+            'exam_subject': exam.subject,
+            'total_sheets': total_sheets,
+            'graded_count': graded_count,
+            'ungraded_count': total_sheets - graded_count,
+            'assigned_students': assigned_students,
+            'unassigned_sheets': total_sheets - assigned_students,
+            'average_score': round(avg_score, 1),
+            'highest_score': round(max_score, 1),
+            'lowest_score': round(min_score, 1),
+            'distribution': dist,
+            'ready_to_publish': graded_count > 0 and assigned_students > 0,
+        })
+
+    except NotFoundError as e:
+        return error_response(str(e), 404)
+    except ForbiddenError as e:
+        return error_response(str(e), 403)
+    except Exception as e:
+        return error_response(f"Failed to generate preview: {str(e)}", 500)
+
+
+@exam_bp.route('/<exam_id>/publish', methods=['POST'])
+@jwt_required()
+@role_required(['teacher'])
+def publish_results(exam_id):
+    """
+    Publish exam results so students can view them.
+
+    POST /api/v1/exams/:exam_id/publish
+    """
+    try:
+        from datetime import datetime
+        current_user_id = get_jwt_identity()
+        exam = ExamService.get_exam_by_id(exam_id, teacher_id=current_user_id)
+
+        if exam.status == 'published':
+            return success_response(
+                data={'exam': exam.to_dict()},
+                message="Results are already published"
+            )
+
+        exam.status = 'published'
+        exam.published_at = datetime.utcnow()
+        exam.save()
+
+        # Send email notifications to students with assigned sheets
+        try:
+            from services.notification_service import notify_results_published
+            sheets = AnswerSheetDoc.objects(exam_id=exam.id)
+            student_ids = set()
+            for s in sheets:
+                if s.student_id and str(s.student_id.id) != str(exam.teacher_id.id):
+                    student_ids.add(s.student_id.id)
+            if student_ids:
+                students = User.objects(id__in=list(student_ids)).only('email')
+                emails = [st.email for st in students if st.email]
+                teacher = User.objects(id=current_user_id).first()
+                teacher_name = teacher.profile.get('name', teacher.email) if teacher else 'Teacher'
+                notify_results_published(emails, exam.title, exam.subject, teacher_name)
+        except Exception as notify_err:
+            print(f"[Publish] Notification failed (non-fatal): {notify_err}")
+
+        return success_response(
+            data={'exam': exam.to_dict()},
+            message="Results published successfully"
+        )
+
+    except NotFoundError as e:
+        return error_response(str(e), 404)
+    except ForbiddenError as e:
+        return error_response(str(e), 403)
+    except Exception as e:
+        return error_response(f"Failed to publish results: {str(e)}", 500)
+
+
+@exam_bp.route('/<exam_id>/unpublish', methods=['POST'])
+@jwt_required()
+@role_required(['teacher'])
+def unpublish_results(exam_id):
+    """
+    Unpublish exam results.
+
+    POST /api/v1/exams/:exam_id/unpublish
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        exam = ExamService.get_exam_by_id(exam_id, teacher_id=current_user_id)
+
+        if exam.status != 'published':
+            return error_response("Exam is not currently published", 400)
+
+        exam.status = 'reviewing'
+        exam.published_at = None
+        exam.save()
+
+        return success_response(
+            data={'exam': exam.to_dict()},
+            message="Results unpublished"
+        )
+
+    except NotFoundError as e:
+        return error_response(str(e), 404)
+    except ForbiddenError as e:
+        return error_response(str(e), 403)
+    except Exception as e:
+        return error_response(f"Failed to unpublish results: {str(e)}", 500)
+
+
+@exam_bp.route('/<exam_id>/sheets/<sheet_id>/assign', methods=['PUT'])
+@jwt_required()
+@role_required(['teacher'])
+def assign_sheet_to_student(exam_id, sheet_id):
+    """
+    Assign an answer sheet to a student by email.
+
+    PUT /api/v1/exams/:examId/sheets/:sheetId/assign
+    Body: { "student_email": "student@example.com" }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        exam = ExamService.get_exam_by_id(exam_id, teacher_id=current_user_id)
+
+        sheet = AnswerSheetDoc.objects(id=sheet_id, exam_id=exam.id).first()
+        if not sheet:
+            return error_response("Answer sheet not found", 404)
+
+        data = request.get_json()
+        if not data or not data.get('student_email'):
+            return error_response("student_email is required", 400)
+
+        student = User.objects(email=data['student_email'], role='student').first()
+        if not student:
+            return error_response(
+                f"No student found with email {data['student_email']}", 404
+            )
+
+        sheet.student_id = student
+        sheet.save()
+
+        return jsonify(success_response(
+            data={
+                'sheet_id': str(sheet.id),
+                'student_id': str(student.id),
+                'student_email': student.email,
+                'student_name': student.profile.get('name', ''),
+            },
+            message="Sheet assigned to student"
+        )), 200
+
+    except NotFoundError as e:
+        return error_response(str(e), 404)
+    except ForbiddenError as e:
+        return error_response(str(e), 403)
+    except Exception as e:
+        return error_response(f"Failed to assign sheet: {str(e)}", 500)
+
+
+@exam_bp.route('/<exam_id>/sheets/bulk-assign', methods=['PUT'])
+@jwt_required()
+@role_required(['teacher'])
+def bulk_assign_sheets(exam_id):
+    """
+    Bulk assign all answer sheets to a single student (for testing).
+
+    PUT /api/v1/exams/:examId/sheets/bulk-assign
+    Body: { "student_email": "student@example.com" }
+    """
+    try:
+        current_user_id = get_jwt_identity()
+        exam = ExamService.get_exam_by_id(exam_id, teacher_id=current_user_id)
+
+        data = request.get_json()
+        if not data or not data.get('student_email'):
+            return error_response("student_email is required", 400)
+
+        student = User.objects(email=data['student_email'], role='student').first()
+        if not student:
+            return error_response(
+                f"No student found with email {data['student_email']}", 404
+            )
+
+        sheets = AnswerSheetDoc.objects(exam_id=exam.id)
+        count = 0
+        for sheet in sheets:
+            sheet.student_id = student
+            sheet.save()
+            count += 1
+
+        return jsonify(success_response(
+            data={
+                'assigned_count': count,
+                'student_email': student.email,
+                'student_name': student.profile.get('name', ''),
+            },
+            message=f"Assigned {count} sheet(s) to {student.email}"
+        )), 200
+
+    except NotFoundError as e:
+        return error_response(str(e), 404)
+    except ForbiddenError as e:
+        return error_response(str(e), 403)
+    except Exception as e:
+        return error_response(f"Failed to bulk assign sheets: {str(e)}", 500)
+
+
+@exam_bp.route('/students', methods=['GET'])
+@jwt_required()
+@role_required(['teacher'])
+def list_students():
+    """
+    List all registered students (for assignment dropdowns).
+
+    GET /api/v1/exams/students
+    """
+    try:
+        students = User.objects(role='student').only('id', 'email', 'profile')
+        result = [
+            {
+                'id': str(s.id),
+                'email': s.email,
+                'name': s.profile.get('name', ''),
+                'roll_number': s.profile.get('roll_number', ''),
+            }
+            for s in students
+        ]
+        return jsonify(success_response(data=result)), 200
+    except Exception as e:
+        return error_response(f"Failed to list students: {str(e)}", 500)
 
 
 @exam_bp.route('/<exam_id>/question-paper/extract', methods=['POST'])
